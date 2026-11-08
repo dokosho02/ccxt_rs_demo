@@ -1,0 +1,127 @@
+name: build
+
+on:
+  workflow_dispatch:
+    inputs:
+      targets:
+        description: "要构建的 target 三元组，逗号分隔；留空=全部"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ------------------------------------------------------------------
+  # 验证全部在 GA ubuntu 上做（本机内存不够，不做本地编译验证）
+  # ------------------------------------------------------------------
+  lint:
+    name: validate (ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: cargo check (debug)
+        run: cargo check --all-targets
+
+  # 按 inputs.targets 过滤出要构建的矩阵
+  prepare:
+    name: prepare matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+    steps:
+      - id: set
+        env:
+          SEL: ${{ inputs.targets }}
+        run: |
+          all='[
+            {"target":"x86_64-unknown-linux-gnu","os":"ubuntu-24.04","smoke":"full"},
+            {"target":"aarch64-unknown-linux-gnu","os":"ubuntu-24.04-arm","smoke":"full"},
+            {"target":"x86_64-pc-windows-msvc","os":"windows-latest","smoke":"version"},
+            {"target":"x86_64-apple-darwin","os":"macos-15-intel","smoke":"version"},
+            {"target":"aarch64-apple-darwin","os":"macos-15-intel","smoke":"none"}
+          ]'
+          if [[ -z "${SEL}" ]]; then
+            echo "matrix=$(jq -c . <<< "${all}")" >> "$GITHUB_OUTPUT"
+          else
+            matrix="$(jq -c --arg sel "${SEL}" \
+              '($sel | split(",") | map(gsub("\\s+";""))) as $keep
+               | [ .[] | select(.target as $t | $keep | index($t)) ]' <<< "${all}")"
+            if [[ "$(jq 'length' <<< "${matrix}")" == "0" ]]; then
+              echo "error: inputs.targets='${SEL}' 没有匹配任何已知 target" >&2
+              exit 1
+            fi
+            echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: build (${{ matrix.target.target }})
+    needs: [lint, prepare]
+    runs-on: ${{ matrix.target.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target.target }}
+
+      - name: Build (release)
+        run: cargo build --release --locked --target ${{ matrix.target.target }}
+
+      - name: Smoke test — version
+        if: matrix.target.smoke == 'version' || matrix.target.smoke == 'full'
+        shell: bash
+        run: |
+          bin="target/${{ matrix.target.target }}/release/ccxt_demo"
+          case "${{ matrix.target.target }}" in *windows*) bin="${bin}.exe";; esac
+          "${bin}" --version
+
+      # ubuntu 原生目标做真实网络冒烟（kraken 对 runner 地区友好）
+      - name: Smoke test — network fetch
+        if: matrix.target.smoke == 'full'
+        shell: bash
+        run: |
+          bin="target/${{ matrix.target.target }}/release/ccxt_demo"
+          for i in 1 2 3; do
+            if timeout 180 "${bin}" --exchange kraken BTC/USDT; then
+              echo "network smoke ok (attempt ${i})"
+              exit 0
+            fi
+            echo "attempt ${i} failed, retrying ..."
+            sleep 10
+          done
+          echo "network smoke failed after 3 attempts" >&2
+          exit 1
+
+      - name: Prepare artifact
+        shell: bash
+        run: |
+          mkdir -p dist
+          bin="target/${{ matrix.target.target }}/release/ccxt_demo"
+          case "${{ matrix.target.target }}" in *windows*) cp "${bin}.exe" dist/;; *) cp "${bin}" dist/; chmod +x dist/ccxt_demo;; esac
+          ls -l dist/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ccxt_demo-${{ matrix.target.target }}
+          path: dist/
+          retention-days: 30
+          if-no-files-found: error
