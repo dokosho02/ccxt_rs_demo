@@ -4,6 +4,8 @@
 
 本机内存不够跑全量 release 编译，所以设计为：**本地只做轻量检查，重活全在 GA 上跑**。
 
+公开仓库的标准 runner 免费不限量；额度与硬限制的完整说明见 [docs/github-actions-free-tier.md](docs/github-actions-free-tier.md)。
+
 ## 目标矩阵
 
 | Target | Runner | 说明 |
